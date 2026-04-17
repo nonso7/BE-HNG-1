@@ -1,5 +1,7 @@
 # HNG Stage 1 — Profile Enrichment API (Go)
 
+**Live**: be-hng-1-production.up.railway.app
+
 A small Go service that accepts a name, enriches it using three free public
 APIs (Genderize, Agify, Nationalize), classifies the result, and persists it
 in SQLite. Duplicates are de-duplicated by name (idempotent creates).

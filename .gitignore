@@ -1,0 +1,9 @@
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+profiles.db*
+.env
+/bin
+/tmp
+*.out

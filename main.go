@@ -26,6 +26,10 @@ func main() {
 	}
 	defer store.Close()
 
+	if _, err := SeedProfiles(store); err != nil {
+		log.Fatalf("seed: %v", err)
+	}
+
 	srv := NewServer(store)
 	httpServer := &http.Server{
 		Addr:              ":" + port,

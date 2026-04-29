@@ -1,268 +1,478 @@
-# Insighta Labs — Profile Query API (Go)
+# Insighta Labs+ — Backend (Stage 3)
 
-**Live**: https://be-hng-1-production.up.railway.app
+**Live:** https://be-hng-1-production.up.railway.app
 
-A Go service that exposes a queryable store of 2,026 demographic profiles.
-It supports combinable filtering, sorting, pagination, and a rule-based
-natural-language search endpoint.
+A secure, multi-interface profile intelligence platform written in Go. Stage 3
+adds GitHub OAuth (PKCE), role-based access control, refresh-token rotation,
+API versioning, CSV export, rate limiting, and request logging on top of the
+Stage 2 query/search/pagination engine.
 
-## Tech
+The CLI and Web Portal are separate repositories that talk to this backend.
 
-- Go 1.22+ (`net/http` with method+path routing, generics)
-- SQLite via `modernc.org/sqlite` (pure Go, no CGO)
-- UUID v7 via `github.com/google/uuid`
-- Seed data embedded into the binary via `//go:embed`
+- **CLI repo:** _(link here)_
+- **Web Portal repo:** _(link here)_
+- **Live web portal:** _(link here)_
 
-## Run locally
+---
+
+## Table of contents
+
+1. [System architecture](#system-architecture)
+2. [Authentication flow](#authentication-flow)
+3. [CLI usage](#cli-usage)
+4. [Token handling approach](#token-handling-approach)
+5. [Role enforcement logic](#role-enforcement-logic)
+6. [Natural-language parsing approach](#natural-language-parsing-approach)
+7. [Endpoint reference](#endpoint-reference)
+8. [Configuration](#configuration)
+9. [Local development](#local-development)
+10. [Deployment](#deployment)
+
+---
+
+## System architecture
+
+```
+                ┌──────────────┐    ┌──────────────┐
+                │     CLI      │    │  Web Portal  │
+                │  (separate)  │    │  (separate)  │
+                └──────┬───────┘    └──────┬───────┘
+                       │  Bearer token     │  HTTP-only cookies + CSRF
+                       │                   │
+                       └─────────┬─────────┘
+                                 ▼
+                ┌────────────────────────────────┐
+                │          Backend (Go)          │
+                │  ┌──────────────────────────┐  │
+                │  │ requestLog → CORS → mux  │  │
+                │  └────────────┬─────────────┘  │
+                │               │                │
+                │   /auth/*  →  authRateLimit ─► handlers
+                │               (10/min per IP)            │
+                │   /api/*   →  versionHeader              │
+                │              → requireAuth               │
+                │              → requireCSRF               │
+                │              → apiRateLimit (60/min/user)│
+                │              → requireAdminForMutation   │
+                │              → handler                   │
+                │                                          │
+                │   ┌──────────────────────────────┐       │
+                │   │   SQLite (modernc, pure Go)  │       │
+                │   │   profiles, users,           │       │
+                │   │   refresh_tokens             │       │
+                │   └──────────────────────────────┘       │
+                └──────────────────────────────────────────┘
+                                 │
+                                 ▼
+                ┌──────────┬──────────┬──────────────┐
+                │ GitHub   │ Genderize│ Agify        │
+                │ OAuth    │ Agify    │ Nationalize  │
+                └──────────┴──────────┴──────────────┘
+```
+
+**Key choices**
+
+- **Pure-Go SQLite** (`modernc.org/sqlite`) keeps deployment trivial — no CGO,
+  no external DB. Tables: `profiles`, `users`, `refresh_tokens`.
+- **Stateless access tokens** (HS256 JWTs, 3-minute expiry) — no DB hit on the
+  hot path. **Stateful refresh tokens** (opaque random, SHA-256 hashed in the
+  DB, 5-minute expiry, single-use rotation) — so a leaked refresh can be
+  revoked.
+- **Middleware chains per route family**, not scattered handler-side checks.
+  Auth/role/version/rate-limit are composable wrappers; handlers stay free of
+  cross-cutting concerns.
+- **Method-based RBAC**: `analyst` may only `GET`, `admin` may use any method.
+  Single rule, single middleware, no per-endpoint permission table to drift.
+
+---
+
+## Authentication flow
+
+GitHub OAuth with PKCE. Two callers (CLI and Web) share the same backend but
+take slightly different paths because of how the redirect lands.
+
+### Web portal flow
+
+```
+Browser                Backend                 GitHub
+   │  GET /auth/github   │                       │
+   ├────────────────────►│                       │
+   │                     │  generates state +    │
+   │                     │  code_verifier;       │
+   │                     │  stores both;         │
+   │                     │  derives challenge    │
+   │  302 to GitHub      │                       │
+   │◄────────────────────┤                       │
+   │  authorize(challenge, state)                │
+   ├────────────────────────────────────────────►│
+   │                     │  302 callback?code+state
+   │◄────────────────────────────────────────────┤
+   │ GET /auth/github/callback?code=...&state=...│
+   ├────────────────────►│                       │
+   │                     │  pop verifier by state│
+   │                     │  POST token exchange  │
+   │                     │  with code+verifier   │
+   │                     ├──────────────────────►│
+   │                     │◄──── access_token ────┤
+   │                     │  GET /user            │
+   │                     ├──────────────────────►│
+   │                     │◄──── user JSON ───────┤
+   │                     │  upsert user          │
+   │                     │  issue access+refresh │
+   │  302 → WEB_APP_URL  │  Set-Cookie: HttpOnly │
+   │◄────────────────────┤  access_token,        │
+   │                     │  refresh_token,       │
+   │                     │  csrf_token (readable)│
+```
+
+### CLI flow
+
+```
+CLI                  Browser            GitHub                 Backend
+ │  generate state +    │                  │                      │
+ │  code_verifier +     │                  │                      │
+ │  challenge           │                  │                      │
+ │  start localhost     │                  │                      │
+ │  callback server     │                  │                      │
+ │                      │  open authorize  │                      │
+ │  ─────────────────► browser ───────────►│                      │
+ │                      │                  │  user authenticates  │
+ │                      │  302 callback ◄──┤                      │
+ │  capture code+state  │                  │                      │
+ │  validate state                                                │
+ │  POST /auth/github/exchange (code, code_verifier, redirect_uri)│
+ │  ─────────────────────────────────────────────────────────────►│
+ │                                          backend exchanges     │
+ │                                          with GitHub, fetches  │
+ │                                          user, upserts,        │
+ │                                          issues tokens         │
+ │  ◄──── { access_token, refresh_token, user } ──────────────────│
+ │  store tokens at ~/.insighta/credentials.json                  │
+```
+
+### Token refresh
+
+`POST /auth/refresh` (body or cookie) → validates the refresh token, **revokes
+it immediately**, issues a new access+refresh pair. Reusing a revoked or
+expired refresh token returns `401`.
+
+### Logout
+
+`POST /auth/logout` revokes the refresh token server-side and clears cookies.
+
+---
+
+## CLI usage
+
+The CLI lives in its own repo; this is the contract it uses.
 
 ```bash
-go run .                     # listens on :8080
-PORT=3000 go run .           # custom port
-DB_PATH=./data.db go run .   # custom SQLite file
+# install (npm package or Go binary; see CLI repo)
+insighta login           # opens browser, completes PKCE flow
+insighta whoami          # GET /api/users/me
+insighta logout
+
+insighta profiles list
+insighta profiles list --gender male --country NG --age-group adult
+insighta profiles list --min-age 25 --max-age 40
+insighta profiles list --sort-by age --order desc
+insighta profiles list --page 2 --limit 20
+insighta profiles get <id>
+insighta profiles search "young males from nigeria"
+insighta profiles create --name "Harriet Tubman"     # admin only
+insighta profiles export --format csv --gender male --country NG
 ```
 
-The seeder runs automatically on startup. If the table already contains
-2,026 rows it is skipped; otherwise the 2,026 profiles are inserted inside a
-single transaction with `INSERT OR IGNORE`, keyed on the UNIQUE name column,
-so re-running is idempotent.
+Credentials are stored at `~/.insighta/credentials.json`:
 
-## Schema
-
-```
-id                   TEXT PRIMARY KEY        -- UUID v7
-name                 TEXT NOT NULL UNIQUE
-gender               TEXT NOT NULL           -- "male" | "female"
-gender_probability   REAL NOT NULL
-age                  INTEGER NOT NULL
-age_group            TEXT NOT NULL           -- child | teenager | adult | senior
-country_id           TEXT NOT NULL           -- ISO 3166-1 alpha-2
-country_name         TEXT NOT NULL
-country_probability  REAL NOT NULL
-created_at           TEXT NOT NULL           -- RFC 3339 UTC
+```json
+{
+  "access_token": "...",
+  "refresh_token": "...",
+  "expires_at": "2026-04-29T12:30:00Z"
+}
 ```
 
-Indexes cover every filter and sort column so no request ever does a
-full-table scan.
+The CLI sends `Authorization: Bearer <access_token>` and `X-API-Version: 1` on
+every request. On `401 invalid_token` it tries `/auth/refresh` once; if that
+also fails it prompts re-login.
 
-## Endpoints
+---
 
-### `GET /api/profiles`
+## Token handling approach
 
-Combines filtering + sorting + pagination in one request. Every parameter is
-optional; multiple filters AND together.
+### Access tokens (stateless)
 
-| Param                      | Type                             | Notes                                           |
-| -------------------------- | -------------------------------- | ----------------------------------------------- |
-| `gender`                   | `male` \| `female`               | Case-insensitive                                |
-| `age_group`                | `child` \| `teenager` \| `adult` \| `senior` | Case-insensitive                    |
-| `country_id`               | 2-letter ISO code                | Case-insensitive                                |
-| `min_age` / `max_age`      | integer ≥ 0                      | Inclusive                                       |
-| `min_gender_probability`   | float 0-1                        | Inclusive                                       |
-| `min_country_probability`  | float 0-1                        | Inclusive                                       |
-| `sort_by`                  | `age` \| `created_at` \| `gender_probability` | Defaults to `created_at`                 |
-| `order`                    | `asc` \| `desc`                  | Defaults to `asc`                               |
-| `page`                     | integer ≥ 1                      | Default 1                                       |
-| `limit`                    | integer 1-50                     | Default 10; values above 50 are capped          |
+- **Format:** standard HS256 JWT — `base64url(header).base64url(payload).base64url(sig)`.
+- **Claims:** `sub` (user id), `username`, `role`, `iat`, `exp`.
+- **Expiry:** **3 minutes** (per spec). Short by design — a stolen token is
+  worthless almost immediately.
+- **Verification:** signature + `exp` only. No DB hit. The user is then loaded
+  by `sub` to enforce `is_active`.
+- **Secret:** `TOKEN_SECRET` env var. If unset, an ephemeral one is generated
+  at startup with a warning (tokens won't survive a restart in that case).
 
-Example:
+### Refresh tokens (stateful, rotated)
 
-```bash
-curl 'http://localhost:8080/api/profiles?gender=male&country_id=NG&min_age=25&sort_by=age&order=desc&page=1&limit=10'
+- **Format:** 32 random bytes, hex-encoded (64 chars). Opaque to the holder.
+- **Storage:** SHA-256 hash of the token in the `refresh_tokens` table — never
+  the raw token. A DB compromise does not directly leak active refresh tokens.
+- **Expiry:** **5 minutes** (per spec).
+- **Rotation:** every successful `/auth/refresh` revokes the presented token
+  and issues a brand-new pair. **One refresh token, one use.** A
+  refresh-token-replay attack is detectable (the second use 401s).
+- **Revocation:** `/auth/logout` sets `revoked_at`. `is_active=false` on the
+  user blocks all future refresh attempts via the `requireAuth` path.
+
+### Web vs. CLI delivery
+
+- **Web:** tokens are set as HTTP-only cookies (access + refresh) plus a
+  non-HttpOnly `csrf_token` cookie that the browser must echo as
+  `X-CSRF-Token` on state-changing requests. SameSite=Lax. Secure when behind
+  HTTPS.
+- **CLI:** tokens are returned in the JSON body of `/auth/github/exchange` and
+  the CLI persists them at `~/.insighta/credentials.json`. CSRF doesn't apply
+  to bearer-token requests.
+
+---
+
+## Role enforcement logic
+
+**One rule:** `analyst` may only issue `GET` requests under `/api/*`. Any
+non-`GET` method (`POST`, `DELETE`, `PUT`, `PATCH`) requires `admin`.
+
+This is enforced in a single middleware (`requireAdminForMutation`) chained
+after `requireAuth`:
+
+```go
+if r.Method != "GET" && user.Role != "admin" {
+    return 403 "Admin role required"
+}
 ```
 
-Response (`200 OK`):
+Rationale:
+
+- One rule means no per-endpoint permission table that can drift.
+- Maps cleanly to the spec: admin "can create and delete", analyst is
+  "read-only".
+- Future endpoints inherit the right behavior automatically: a new `POST`
+  requires admin without any code change.
+
+`/auth/*` endpoints (login, refresh, logout, callback) bypass role checks —
+they are user-self operations that only require a valid identity (or none, for
+login).
+
+**Granting admin.** New users default to `analyst`. Set
+`ADMIN_GITHUB_USERNAMES=user1,user2` and those usernames are auto-promoted on
+first login. Existing users' roles are not modified by this env var (avoids
+accidental privilege escalation on rename).
+
+---
+
+## Natural-language parsing approach
+
+Rule-based, deterministic, regex-driven. **No LLM, no ML.** Lower-cases and
+strips the input, then runs four independent scanners and AND-combines the
+results.
+
+| Scanner | Recognises |
+| --- | --- |
+| Gender | `male`, `males`, `men`, `boys`, `girls`, `females`, `women`, `ladies` (word-boundary; both families present → no filter) |
+| Age group | `child`/`children`/`kid`, `teen`/`teenager`, `adult`, `senior`/`elder`/`elderly` (longest alias wins) |
+| Age bounds | `above N`, `over N`, `older than N`, `under N`, `between N and M`, `N-M`, `N to M`, `aged N`, `young` (16-24), `old` (60+) |
+| Country | aliases (`usa`, `uk`, `britain`, `ivory coast`, `drc`...) → full names from the seed (`south africa` beats `africa`) → bare ISO-2 (`NG`, `KE`) |
+
+If no scanner matches anything, the endpoint returns `422 Unable to interpret
+query`. If contradictory bounds are inferred, the query returns matched=false.
+
+Worked examples:
+
+| Query | Filters |
+| --- | --- |
+| `young males from nigeria` | gender=male, min_age=16, max_age=24, country_id=NG |
+| `senior women in south africa` | gender=female, age_group=senior, country_id=ZA |
+| `males between 25 and 40 from kenya` | gender=male, min_age=25, max_age=40, country_id=KE |
+| `aged 42` | min_age=max_age=42 |
+
+Limitations: no demonyms (`nigerians`), no number words (`twenty-five`), no
+free-form negation, no fuzzy spelling, no relative dates.
+
+---
+
+## Endpoint reference
+
+All `/api/*` endpoints require `X-API-Version: 1` and a valid access token
+(`Authorization: Bearer <token>` or `access_token` cookie).
+
+### Auth
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/auth/github` | Redirects to GitHub OAuth (web flow) |
+| `GET` | `/auth/github/callback` | OAuth callback (web flow); sets cookies, redirects to `WEB_APP_URL` |
+| `POST` | `/auth/github/exchange` | CLI flow: `{code, code_verifier, redirect_uri}` → `{access_token, refresh_token, user}` |
+| `POST` | `/auth/refresh` | Rotate `{refresh_token}` → new pair |
+| `POST` | `/auth/logout` | Revoke refresh token + clear cookies |
+| `GET` | `/auth/csrf` | Issue a CSRF cookie for the web portal |
+
+### Profiles
+
+| Method | Path | Role | Description |
+| --- | --- | --- | --- |
+| `GET` | `/api/profiles` | analyst+ | Filter, sort, paginate (Stage 2 unchanged + new pagination shape) |
+| `GET` | `/api/profiles/{id}` | analyst+ | Single profile by id |
+| `GET` | `/api/profiles/search?q=...` | analyst+ | NL search |
+| `GET` | `/api/profiles/export?format=csv` | analyst+ | CSV export, applies same filters as list |
+| `POST` | `/api/profiles` | admin | Create — calls Genderize/Agify/Nationalize, persists, returns the row |
+| `DELETE` | `/api/profiles/{id}` | admin | Delete by id |
+
+### Users
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/api/users/me` | The authenticated user |
+
+### Pagination shape (list + search)
 
 ```json
 {
   "status": "success",
   "page": 1,
   "limit": 10,
-  "total": 43,
-  "data": [
-    {
-      "id": "b3f9c1e2-7d4a-4c91-9c2a-1f0a8e5b6d12",
-      "name": "emmanuel",
-      "gender": "male",
-      "gender_probability": 0.99,
-      "age": 34,
-      "age_group": "adult",
-      "country_id": "NG",
-      "country_name": "Nigeria",
-      "country_probability": 0.85,
-      "created_at": "2026-04-01T12:00:00Z"
-    }
-  ]
+  "total": 2026,
+  "total_pages": 203,
+  "links": {
+    "self": "/api/profiles?limit=10&page=1",
+    "next": "/api/profiles?limit=10&page=2",
+    "prev": null
+  },
+  "data": [ ... ]
 }
 ```
 
-### `GET /api/profiles/search?q=...`
+### Error envelope
 
-Rule-based natural-language search. Pagination (`page`, `limit`) and sort
-(`sort_by`, `order`) apply here too. See the next section for full parsing
-behavior.
+```json
+{ "status": "error", "message": "<human readable>" }
+```
+
+| Status | When |
+| --- | --- |
+| 400 | Missing `X-API-Version`, malformed body, missing required field |
+| 401 | Missing/invalid access or refresh token |
+| 403 | Non-admin attempting a mutation; CSRF mismatch; account disabled |
+| 404 | Unknown profile/user |
+| 422 | Bad query parameter, NL query couldn't be parsed |
+| 429 | Rate limit exceeded |
+| 502 | Upstream API (Genderize/Agify/Nationalize/GitHub) returned bad data |
+
+### Rate limits
+
+| Scope | Limit |
+| --- | --- |
+| `/auth/*` | 10 requests / minute / IP |
+| `/api/*` | 60 requests / minute / authenticated user |
+
+Sliding window. Returns `429` with `Retry-After: 60`.
+
+---
+
+## Configuration
+
+| Env var | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `PORT` | no | `8080` | HTTP port |
+| `DB_PATH` | no | `profiles.db` | SQLite file path |
+| `TOKEN_SECRET` | yes (prod) | random ephemeral | HMAC secret for access tokens |
+| `GITHUB_CLIENT_ID` | yes (web) | — | **Web** OAuth App client id (used by `/auth/github` + web callback) |
+| `GITHUB_CLIENT_SECRET` | yes (web) | — | **Web** OAuth App client secret |
+| `GITHUB_REDIRECT_URI` | yes (web) | derived | e.g. `https://your-portal/auth/github/callback` |
+| `GITHUB_CLI_CLIENT_ID` | yes (CLI) | — | **CLI** OAuth App client id (used by `/auth/github/exchange` + `/auth/cli/config`); the CLI's redirect URI is fixed at `http://127.0.0.1:9876/callback` |
+| `GITHUB_CLI_CLIENT_SECRET` | yes (CLI) | — | **CLI** OAuth App client secret |
+| `WEB_APP_URL` | no | empty | Where to redirect after web login; if empty, the callback returns JSON |
+| `ADMIN_GITHUB_USERNAMES` | no | empty | Comma-separated list of GitHub usernames that get admin on first login |
+| `GRADER_TOKEN` | no | empty | If set, exposes `POST /auth/test/issue` for the grader bot to obtain admin/analyst tokens without the OAuth dance |
+
+---
+
+## Local development
 
 ```bash
-curl 'http://localhost:8080/api/profiles/search?q=young%20males%20from%20nigeria'
+# Run with defaults
+go run .
+
+# Realistic local config
+PORT=8080 \
+DB_PATH=./profiles.db \
+TOKEN_SECRET=$(openssl rand -hex 32) \
+GITHUB_CLIENT_ID=Iv1.xxxxx \
+GITHUB_CLIENT_SECRET=xxxxx \
+GITHUB_REDIRECT_URI=http://localhost:8080/auth/github/callback \
+WEB_APP_URL=http://localhost:3000 \
+ADMIN_GITHUB_USERNAMES=nonso7 \
+go run .
 ```
 
-### `GET /api/profiles/{id}`, `DELETE /api/profiles/{id}`, `POST /api/profiles`
+The seeder runs at startup. The 2,026 profiles are inserted in a single
+transaction with `INSERT OR IGNORE` keyed on `name`, so re-runs are a no-op.
 
-Preserved from stage 1. `POST` enriches a name via Genderize/Agify/Nationalize
-and resolves `country_name` from a lookup derived from the seed.
+### Smoke test against a live build
 
-## Natural language parsing
+```bash
+# Issue an admin token (requires GRADER_TOKEN)
+curl -sS -H "X-Grader-Token: $GRADER_TOKEN" \
+     -H 'Content-Type: application/json' \
+     -d '{"username":"adminbot","role":"admin"}' \
+     http://localhost:8080/auth/test/issue
 
-The parser is deterministic and built on compiled regex patterns. No LLM, no
-ML. The input is lower-cased and stripped, then four scanners run
-independently; the resulting filters are AND-ed together. If none of them
-match anything, the endpoint returns `422` with
-`{"status":"error","message":"Unable to interpret query"}`.
-
-### 1. Gender
-
-Word-boundary matches (so `male` will not match inside `female`):
-
-| Keyword group                               | Filter          |
-| ------------------------------------------- | --------------- |
-| `male`, `males`, `men`, `boy`, `boys`, `guys`, `gentlemen` | `gender=male`   |
-| `female`, `females`, `women`, `girl`, `girls`, `ladies`    | `gender=female` |
-
-If **both** families appear (e.g. `"male and female teenagers"`), no gender
-filter is emitted — the query is treated as "either gender".
-
-### 2. Age group
-
-Longest-alias-first match against the canonical groups:
-
-| Keyword                                 | age_group   |
-| --------------------------------------- | ----------- |
-| `child`, `children`, `kid`, `kids`      | `child`     |
-| `teenager`, `teenagers`, `teen`, `teens` | `teenager` |
-| `adult`, `adults`                       | `adult`     |
-| `senior`, `seniors`, `elder`, `elders`, `elderly` | `senior` |
-
-### 3. Age bounds (inclusive, numeric)
-
-| Pattern                                                    | Effect                 |
-| ---------------------------------------------------------- | ---------------------- |
-| `above N`, `over N`, `older than N`, `greater than N`, `at least N`, `>N`, `>=N` | `min_age = N` |
-| `below N`, `under N`, `younger than N`, `less than N`, `at most N`, `<N`, `<=N`  | `max_age = N` |
-| `between N and M`                                          | `min_age=N`, `max_age=M` |
-| `N-M`, `N to M`                                            | `min_age=N`, `max_age=M` |
-| `aged N`, `age N`                                          | `min_age = max_age = N`  |
-| `young`                                                    | `min_age=16`, `max_age=24` (shorthand only — not a stored group) |
-| `old`                                                      | `min_age=60` (when no other bound is set)                        |
-
-Explicit numeric bounds always win over the `young` / `old` shorthands.
-
-### 4. Country
-
-Tried in order:
-
-1. Common aliases: `usa`, `america`, `uk`, `britain`, `england`, `ivory coast`,
-   `drc`, `congo kinshasa`, `congo brazzaville`, `sao tome`, `cape verde`,
-   `swaziland`.
-2. Full country names extracted from the seed file (longest match wins, so
-   `south africa` beats `africa` and `central african republic` beats
-   `african republic`).
-3. Bare ISO-2 code (e.g. `NG`, `KE`) if it's present in the seed.
-
-The successful phrase is emitted as `country_id`.
-
-### Worked examples
-
-| Query                                 | Resulting filters                                                 |
-| ------------------------------------- | ----------------------------------------------------------------- |
-| `young males`                         | `gender=male`, `min_age=16`, `max_age=24`                         |
-| `females above 30`                    | `gender=female`, `min_age=30`                                     |
-| `people from angola`                  | `country_id=AO`                                                   |
-| `adult males from kenya`              | `gender=male`, `age_group=adult`, `country_id=KE`                 |
-| `male and female teenagers above 17`  | `age_group=teenager`, `min_age=17`                                |
-| `women in south africa`               | `gender=female`, `country_id=ZA`                                  |
-| `seniors above 70`                    | `age_group=senior`, `min_age=70`                                  |
-| `males between 25 and 40`             | `gender=male`, `min_age=25`, `max_age=40`                         |
-| `aged 42`                             | `min_age=max_age=42`                                              |
-
-## Parser limitations
-
-Things the current rule-based parser deliberately does **not** handle:
-
-- **Demonyms** — `nigerians`, `kenyan women`, `a french girl`. Only explicit
-  country names / codes / aliases are resolved. Say `from kenya` instead.
-- **OR semantics** — `males or females` or `nigerians or ghanaians` are not
-  distinguished from AND-combinations. When conflicting filters appear
-  (`from nigeria and from kenya`) only the longest match wins.
-- **Number words** — `twenty-five`, `over fifty`. Only numeric digits are
-  recognised.
-- **Free-form negation** — `not male`, `non-senior`, `excluding children`.
-  Anything preceded by a negation is still matched.
-- **Fuzzy / misspelt tokens** — `nigera`, `teenagrs`. Matching is exact.
-- **Relative dates / recency** — `recent signups`, `created this week`.
-  `created_at` filtering is not exposed in the NL query.
-- **Probability thresholds in prose** — `highly confident females`, `likely
-  from angola`. Use the typed parameters (`min_gender_probability`,
-  `min_country_probability`) instead.
-- **Exact-age ranges without a verb** — `42-year-olds`, `45s`. Use `aged 42`
-  or `42 to 44`.
-- **Contradictions** — `aged 10 and over 30` resolves to the last-parsed
-  bound; `between 40 and 20` is normalised (swapped). A fully nonsensical
-  query that still matches something (e.g. `aged 60 under 20`) will return
-  an empty result set rather than a validation error.
-- **Country-less location phrases** — `from the capital`, `in europe`,
-  `african people`. The parser only resolves countries, not regions or
-  cities.
-- **Language other than English.**
-
-When a query contains *no* recognised token at all, the endpoint returns the
-canonical error instead of a (misleading) empty success response:
-
-```json
-{ "status": "error", "message": "Unable to interpret query" }
+# Use it
+TOK="<access_token from above>"
+curl -sS -H "Authorization: Bearer $TOK" -H 'X-API-Version: 1' \
+     http://localhost:8080/api/profiles?limit=2
 ```
 
-## Error responses
-
-```json
-{ "status": "error", "message": "<reason>" }
-```
-
-| Status | When                                                       |
-| ------ | ---------------------------------------------------------- |
-| 400    | Missing or empty required parameter (e.g. `q`)             |
-| 404    | Unknown profile id                                         |
-| 422    | Invalid parameter type or value (`Invalid query parameters`); or an NL query that cannot be interpreted |
-| 502    | An upstream API (POST enrichment only) returned bad data   |
-| 500    | Any other server failure                                   |
-
-## CORS
-
-Every response carries `Access-Control-Allow-Origin: *`. `OPTIONS`
-preflights are handled.
+---
 
 ## Deployment
 
-A `Dockerfile` is provided. The seed file is embedded into the binary so
-there is nothing to upload at runtime. SQLite lives at `/data/profiles.db`
-in the container — mount a volume there on Railway/Fly/etc. to keep data
+A `Dockerfile` and `railway.json` are included. SQLite lives at
+`/data/profiles.db` in the container — mount a volume there to persist data
 between deploys.
 
 ```bash
 docker build -t insighta-api .
-docker run --rm -p 8080:8080 -v $PWD/data:/data insighta-api
+docker run --rm -p 8080:8080 -v $PWD/data:/data \
+  -e TOKEN_SECRET=$(openssl rand -hex 32) \
+  -e GITHUB_CLIENT_ID=... \
+  -e GITHUB_CLIENT_SECRET=... \
+  -e GITHUB_REDIRECT_URI=http://localhost:8080/auth/github/callback \
+  insighta-api
 ```
 
-`railway.json` is included for Railway deployments.
+CI runs on every PR to `main` (`.github/workflows/ci.yml`): `go vet`, `go
+build`, `go test ./...`.
+
+---
 
 ## Project layout
 
 ```
-main.go       server bootstrap, graceful shutdown, seeder invocation
-handlers.go   HTTP handlers, query validation, CORS middleware
-store.go      SQLite schema, migration, filter/sort/paginate SQL
-search.go     rule-based natural-language parser
-seed.go       embedded JSON + idempotent seeder
-classify.go   age-group classifier (POST endpoint)
-external.go   Genderize / Agify / Nationalize clients (POST endpoint)
-models.go     request/response types + UTCTime marshaller
-profiles_seed.json  2,026 seeded profiles (embedded via go:embed)
+main.go            bootstrap, env wiring, graceful shutdown
+handlers.go        Routes(), profile + user handlers, query parsing
+auth.go            OAuth handlers, refresh, logout, exchange, cookies
+middleware.go      requireAuth, requireAdminForMutation, requireVersionHeader,
+                   requireCSRF, rate limiters, request log
+tokens.go          HS256 access tokens, refresh-token primitives
+pkce.go            in-memory state↔verifier store with TTL
+users.go           User model, GitHub upsert, refresh-token storage
+grader.go          GRADER_TOKEN-gated test-issue endpoint
+export.go          CSV export
+pagination.go      total_pages + self/next/prev links
+store.go           SQLite schema + filter/sort/paginate SQL
+search.go          rule-based NL parser
+seed.go            embedded JSON + idempotent seeder
+classify.go        age-group classifier
+external.go        Genderize / Agify / Nationalize clients
+models.go          response envelopes + UTCTime
+profiles_seed.json 2,026 seeded profiles (embedded via go:embed)
 ```

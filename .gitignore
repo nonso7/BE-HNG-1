@@ -4,6 +4,13 @@
 *.db-shm
 profiles.db*
 .env
+.env.*
 /bin
 /tmp
 *.out
+
+# Compiled binaries
+/stage1
+/insighta
+/be-hng-1
+/server

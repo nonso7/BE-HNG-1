@@ -44,6 +44,8 @@ func main() {
 		},
 	}
 
+	logStartupConfig(cfg)
+
 	srv := NewServer(store, cfg)
 	httpServer := &http.Server{
 		Addr:              ":" + port,
@@ -83,4 +85,39 @@ func parseAdminUsernames(s string) map[string]bool {
 		}
 	}
 	return m
+}
+
+func logStartupConfig(cfg ServerConfig) {
+	preview := func(s string) string {
+		if s == "" {
+			return "(unset)"
+		}
+		if len(s) <= 4 {
+			return "(set, len=" + itoa(len(s)) + ")"
+		}
+		return s[:4] + "... (len=" + itoa(len(s)) + ")"
+	}
+	log.Printf("startup config:")
+	log.Printf("  GITHUB_CLIENT_ID         = %s", preview(cfg.Auth.webClientID))
+	log.Printf("  GITHUB_CLIENT_SECRET     = %s", preview(cfg.Auth.webClientSecret))
+	log.Printf("  GITHUB_REDIRECT_URI      = %q", cfg.Auth.webRedirectURI)
+	log.Printf("  GITHUB_CLI_CLIENT_ID     = %s", preview(cfg.Auth.cliClientID))
+	log.Printf("  GITHUB_CLI_CLIENT_SECRET = %s", preview(cfg.Auth.cliClientSecret))
+	log.Printf("  WEB_APP_URL              = %q", cfg.Auth.webAppURL)
+	log.Printf("  ADMIN_GITHUB_USERNAMES   = %d entries", len(cfg.Auth.adminUsernames))
+	log.Printf("  GRADER_TOKEN             = %v", os.Getenv("GRADER_TOKEN") != "")
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var b [20]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(b[i:])
 }

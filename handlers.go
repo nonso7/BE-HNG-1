@@ -15,40 +15,90 @@ import (
 
 type Server struct {
 	store       *Store
-	codeToName  map[string]string // ISO-2 → country name (for POST + NL search)
+	codeToName  map[string]string
+	signer      *tokenSigner
+	auth        *Auth
+	authLimiter *rateLimiter
+	apiLimiter  *rateLimiter
 }
 
-func NewServer(store *Store) *Server {
+type ServerConfig struct {
+	Auth   authConfig
+	Secret string
+}
+
+func NewServer(store *Store, cfg ServerConfig) *Server {
 	codeMap, err := SeedCountryMap()
 	if err != nil {
 		log.Printf("warn: could not build country map from seed: %v", err)
 		codeMap = map[string]string{}
 	}
-	return &Server{store: store, codeToName: codeMap}
+	signer := newTokenSigner(cfg.Secret)
+	auth := newAuth(cfg.Auth, store, signer)
+	return &Server{
+		store:       store,
+		codeToName:  codeMap,
+		signer:      signer,
+		auth:        auth,
+		authLimiter: newRateLimiter(10, time.Minute),
+		apiLimiter:  newRateLimiter(60, time.Minute),
+	}
 }
 
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/profiles", s.createProfile)
-	mux.HandleFunc("GET /api/profiles", s.listProfiles)
-	// "search" is a literal segment so Go 1.22 mux ranks it above {id}.
-	mux.HandleFunc("GET /api/profiles/search", s.searchProfiles)
-	mux.HandleFunc("GET /api/profiles/{id}", s.getProfile)
-	mux.HandleFunc("DELETE /api/profiles/{id}", s.deleteProfile)
+
+	authChain := func(h http.HandlerFunc) http.Handler {
+		return chainMiddleware(http.HandlerFunc(h), s.authRateLimit)
+	}
+	apiChain := func(h http.HandlerFunc) http.Handler {
+		return chainMiddleware(http.HandlerFunc(h),
+			s.requireVersionHeader,
+			s.requireAuth,
+			s.requireCSRF,
+			s.apiRateLimit,
+			s.requireAdminForMutation,
+		)
+	}
+
+	mux.Handle("GET /auth/github", authChain(s.auth.authGithub))
+	mux.Handle("GET /auth/github/callback", authChain(s.auth.authGithubCallback))
+	mux.Handle("POST /auth/github/exchange", authChain(s.auth.authGithubExchange))
+	mux.Handle("POST /auth/refresh", authChain(s.auth.authRefresh))
+	mux.Handle("POST /auth/logout", authChain(s.auth.authLogout))
+	mux.Handle("GET /auth/csrf", authChain(s.auth.authCSRF))
+	mux.Handle("GET /auth/cli/config", authChain(s.auth.authCLIConfig))
+	mux.Handle("POST /auth/test/issue", authChain(s.auth.authTestIssue))
+
+	mux.Handle("GET /api/profiles", apiChain(s.listProfiles))
+	mux.Handle("POST /api/profiles", apiChain(s.createProfile))
+	mux.Handle("GET /api/profiles/search", apiChain(s.searchProfiles))
+	mux.Handle("GET /api/profiles/export", apiChain(s.exportProfiles))
+	mux.Handle("GET /api/profiles/{id}", apiChain(s.getProfile))
+	mux.Handle("DELETE /api/profiles/{id}", apiChain(s.deleteProfile))
+	mux.Handle("GET /api/users/me", apiChain(s.getMe))
+
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{
 			"status":  "success",
-			"message": "Insighta Labs Profile API. Try /api/profiles or /api/profiles/search?q=...",
+			"message": "Insighta Labs+ Profile API. Authenticate via /auth/github.",
 		})
 	})
-	return withCORS(mux)
+
+	return requestLog(withCORS(mux))
 }
 
 func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			origin = "*"
+		}
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Version, X-CSRF-Token, X-Grader-Token")
+		w.Header().Set("Vary", "Origin")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -66,8 +116,6 @@ func writeJSON(w http.ResponseWriter, status int, body interface{}) {
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, errorResponse{Status: "error", Message: message})
 }
-
-// --- POST /api/profiles ---
 
 func (s *Server) createProfile(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
@@ -178,8 +226,6 @@ func upstreamMessage(err error, api string) string {
 	return api + " returned an invalid response"
 }
 
-// --- GET /api/profiles/{id} ---
-
 func (s *Server) getProfile(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	p, err := s.store.GetByID(id)
@@ -194,8 +240,6 @@ func (s *Server) getProfile(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, getResponse{Status: "success", Data: p})
 }
-
-// --- DELETE /api/profiles/{id} ---
 
 func (s *Server) deleteProfile(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
@@ -212,8 +256,6 @@ func (s *Server) deleteProfile(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// --- GET /api/profiles ---
-
 func (s *Server) listProfiles(w http.ResponseWriter, r *http.Request) {
 	filter, err := parseListQuery(r)
 	if err != nil {
@@ -226,16 +268,17 @@ func (s *Server) listProfiles(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "Internal server error")
 		return
 	}
+	totalPages, links := buildPagination(r.URL.Path, r.URL.Query(), filter.Page, filter.Limit, total)
 	writeJSON(w, http.StatusOK, listResponse{
-		Status: "success",
-		Page:   filter.Page,
-		Limit:  filter.Limit,
-		Total:  total,
-		Data:   profiles,
+		Status:     "success",
+		Page:       filter.Page,
+		Limit:      filter.Limit,
+		Total:      total,
+		TotalPages: totalPages,
+		Links:      links,
+		Data:       profiles,
 	})
 }
-
-// --- GET /api/profiles/search ---
 
 func (s *Server) searchProfiles(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query().Get("q")
@@ -250,7 +293,6 @@ func (s *Server) searchProfiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Pagination + sort from the query string override defaults.
 	page, limit, err := parsePageLimit(r)
 	if err != nil {
 		writeError(w, http.StatusUnprocessableEntity, err.Error())
@@ -274,19 +316,30 @@ func (s *Server) searchProfiles(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "Internal server error")
 		return
 	}
+	totalPages, links := buildPagination(r.URL.Path, r.URL.Query(), f.Page, f.Limit, total)
 	writeJSON(w, http.StatusOK, listResponse{
-		Status: "success",
-		Page:   f.Page,
-		Limit:  f.Limit,
-		Total:  total,
-		Data:   profiles,
+		Status:     "success",
+		Page:       f.Page,
+		Limit:      f.Limit,
+		Total:      total,
+		TotalPages: totalPages,
+		Links:      links,
+		Data:       profiles,
 	})
 }
 
-// --- Query parsing helpers ---
+func (s *Server) getMe(w http.ResponseWriter, r *http.Request) {
+	user := userFromCtx(r)
+	if user == nil {
+		writeError(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status": "success",
+		"data":   user,
+	})
+}
 
-// Any malformed value returns the generic "Invalid query parameters" error
-// per the spec.
 var errInvalidQuery = errors.New("Invalid query parameters")
 
 func parseListQuery(r *http.Request) (ListFilter, error) {

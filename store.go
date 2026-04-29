@@ -30,8 +30,6 @@ func OpenStore(path string) (*Store, error) {
 			return nil, err
 		}
 	}
-	// Drop a pre-Stage-2 profiles table so the new schema below can apply
-	// cleanly on top of an old persistent volume.
 	var tableExists int
 	_ = db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='profiles'`).Scan(&tableExists)
 	if tableExists > 0 {
@@ -63,6 +61,29 @@ func OpenStore(path string) (*Store, error) {
 	CREATE INDEX IF NOT EXISTS idx_profiles_gender_prob ON profiles(gender_probability);
 	CREATE INDEX IF NOT EXISTS idx_profiles_country_prob ON profiles(country_probability);
 	CREATE INDEX IF NOT EXISTS idx_profiles_created_at ON profiles(created_at);
+
+	CREATE TABLE IF NOT EXISTS users (
+		id TEXT PRIMARY KEY,
+		github_id TEXT NOT NULL UNIQUE,
+		username TEXT NOT NULL,
+		email TEXT,
+		avatar_url TEXT,
+		role TEXT NOT NULL DEFAULT 'analyst',
+		is_active INTEGER NOT NULL DEFAULT 1,
+		last_login_at TEXT,
+		created_at TEXT NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+
+	CREATE TABLE IF NOT EXISTS refresh_tokens (
+		token_hash TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		expires_at TEXT NOT NULL,
+		revoked_at TEXT,
+		FOREIGN KEY (user_id) REFERENCES users(id)
+	);
+	CREATE INDEX IF NOT EXISTS idx_refresh_user ON refresh_tokens(user_id);
 	`
 	if _, err := db.Exec(schema); err != nil {
 		return nil, err
@@ -113,8 +134,6 @@ func (s *Store) GetByID(id string) (*Profile, error) {
 	return p, err
 }
 
-// InsertIgnore inserts a profile. If a profile with the same name already
-// exists, it silently does nothing. Returns (true, nil) on actual insert.
 func (s *Store) InsertIgnore(p *Profile) (bool, error) {
 	res, err := s.db.Exec(
 		`INSERT OR IGNORE INTO profiles (`+profileColumns+`)
@@ -133,7 +152,6 @@ func (s *Store) InsertIgnore(p *Profile) (bool, error) {
 	return n > 0, nil
 }
 
-// Insert inserts a profile, erroring on duplicate name.
 func (s *Store) Insert(p *Profile) error {
 	_, err := s.db.Exec(
 		`INSERT INTO profiles (`+profileColumns+`)
@@ -166,8 +184,6 @@ func (s *Store) Count() (int, error) {
 	return n, err
 }
 
-// ListFilter carries every dimension of the Stage 2 list query:
-// filters, sort, and pagination.
 type ListFilter struct {
 	Gender         string
 	CountryID      string
@@ -177,24 +193,19 @@ type ListFilter struct {
 	MinGenderProb  *float64
 	MinCountryProb *float64
 
-	SortBy string // "age" | "created_at" | "gender_probability"
-	Order  string // "asc" | "desc"
+	SortBy string
+	Order  string
 
-	Page  int // 1-indexed
+	Page  int
 	Limit int
 }
 
-// sortColumns whitelists which columns are sortable. Keys are the user-facing
-// names; values are the real SQL column names. Never interpolate a non-whitelist
-// value into SQL.
 var sortColumns = map[string]string{
 	"age":                "age",
 	"created_at":         "created_at",
 	"gender_probability": "gender_probability",
 }
 
-// buildWhere returns the WHERE fragment (without the "WHERE" keyword) and its
-// bind args. Callers prepend "WHERE " when there's at least one clause.
 func buildWhere(f ListFilter) (string, []interface{}) {
 	var clauses []string
 	var args []interface{}
@@ -229,12 +240,9 @@ func buildWhere(f ListFilter) (string, []interface{}) {
 	return strings.Join(clauses, " AND "), args
 }
 
-// List runs the filter + sort + paginate query and also returns the total
-// matching count (for pagination metadata).
 func (s *Store) List(f ListFilter) ([]Profile, int, error) {
 	where, args := buildWhere(f)
 
-	// Total count (same WHERE, no LIMIT/OFFSET).
 	countQ := `SELECT COUNT(*) FROM profiles`
 	if where != "" {
 		countQ += ` WHERE ` + where
@@ -244,7 +252,6 @@ func (s *Store) List(f ListFilter) ([]Profile, int, error) {
 		return nil, 0, err
 	}
 
-	// Validate + resolve sort column.
 	col, ok := sortColumns[f.SortBy]
 	if !ok {
 		col = "created_at"
@@ -268,8 +275,6 @@ func (s *Store) List(f ListFilter) ([]Profile, int, error) {
 	if where != "" {
 		q += ` WHERE ` + where
 	}
-	// Tie-break on id so ordering is stable for pagination when the sort key
-	// has ties (common with age / gender_probability).
 	q += fmt.Sprintf(` ORDER BY %s %s, id ASC LIMIT ? OFFSET ?`, col, order)
 	args = append(args, limit, offset)
 
@@ -280,6 +285,50 @@ func (s *Store) List(f ListFilter) ([]Profile, int, error) {
 	defer rows.Close()
 
 	out := make([]Profile, 0, limit)
+	for rows.Next() {
+		p, err := scanProfile(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		out = append(out, *p)
+	}
+	return out, total, rows.Err()
+}
+
+func (s *Store) ListAll(f ListFilter) ([]Profile, int, error) {
+	where, args := buildWhere(f)
+
+	countQ := `SELECT COUNT(*) FROM profiles`
+	if where != "" {
+		countQ += ` WHERE ` + where
+	}
+	var total int
+	if err := s.db.QueryRow(countQ, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	col, ok := sortColumns[f.SortBy]
+	if !ok {
+		col = "created_at"
+	}
+	order := "ASC"
+	if strings.EqualFold(f.Order, "desc") {
+		order = "DESC"
+	}
+
+	q := `SELECT ` + profileColumns + ` FROM profiles`
+	if where != "" {
+		q += ` WHERE ` + where
+	}
+	q += fmt.Sprintf(` ORDER BY %s %s, id ASC`, col, order)
+
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	out := make([]Profile, 0, total)
 	for rows.Next() {
 		p, err := scanProfile(rows)
 		if err != nil {

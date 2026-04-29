@@ -2,8 +2,6 @@ package main
 
 import "time"
 
-// UTCTime marshals to RFC 3339 UTC ("Z") with second precision, matching the
-// Stage 2 response examples (e.g. "2026-04-01T12:00:00Z").
 type UTCTime time.Time
 
 func (t UTCTime) MarshalJSON() ([]byte, error) {
@@ -12,7 +10,6 @@ func (t UTCTime) MarshalJSON() ([]byte, error) {
 
 func (t UTCTime) Time() time.Time { return time.Time(t) }
 
-// Profile is the shape returned by all endpoints. Field order mirrors the spec.
 type Profile struct {
 	ID                 string  `json:"id"`
 	Name               string  `json:"name"`
@@ -42,11 +39,12 @@ type getResponse struct {
 	Data   *Profile `json:"data"`
 }
 
-// listResponse is the payload for GET /api/profiles and /api/profiles/search.
 type listResponse struct {
-	Status string    `json:"status"`
-	Page   int       `json:"page"`
-	Limit  int       `json:"limit"`
-	Total  int       `json:"total"`
-	Data   []Profile `json:"data"`
+	Status     string          `json:"status"`
+	Page       int             `json:"page"`
+	Limit      int             `json:"limit"`
+	Total      int             `json:"total"`
+	TotalPages int             `json:"total_pages"`
+	Links      paginationLinks `json:"links"`
+	Data       []Profile       `json:"data"`
 }

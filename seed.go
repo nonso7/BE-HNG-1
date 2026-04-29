@@ -36,23 +36,18 @@ func parseSeed() ([]seedEntry, error) {
 	return sf.Profiles, nil
 }
 
-// SeedProfiles inserts every profile from the embedded JSON using INSERT OR
-// IGNORE keyed on the UNIQUE(name) constraint, so re-running is a no-op.
-// Returns the number of rows actually inserted.
 func SeedProfiles(s *Store) (int, error) {
 	entries, err := parseSeed()
 	if err != nil {
 		return 0, err
 	}
 
-	// Fast path: if the DB already holds everything, skip the whole batch.
 	current, err := s.Count()
 	if err == nil && current >= len(entries) {
 		log.Printf("seed: %d rows already present, skipping", current)
 		return 0, nil
 	}
 
-	// Spread CreatedAt across the batch so sort_by=created_at is meaningful.
 	start := time.Now().UTC().Add(-time.Duration(len(entries)) * time.Millisecond)
 
 	tx, err := s.db.Begin()
@@ -97,9 +92,6 @@ func SeedProfiles(s *Store) (int, error) {
 	return inserted, nil
 }
 
-// SeedCountryMap returns the ISO-2 code → country name map derived from the
-// seed file. Used by the NL parser so it can resolve "nigeria" → "NG" without
-// shipping a separate country list.
 func SeedCountryMap() (map[string]string, error) {
 	entries, err := parseSeed()
 	if err != nil {

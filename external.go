@@ -12,10 +12,10 @@ import (
 var httpClient = &http.Client{Timeout: 20 * time.Second}
 
 type genderizeResp struct {
-	Name        string   `json:"name"`
-	Gender      *string  `json:"gender"`
-	Probability float64  `json:"probability"`
-	Count       int      `json:"count"`
+	Name        string  `json:"name"`
+	Gender      *string `json:"gender"`
+	Probability float64 `json:"probability"`
+	Count       int     `json:"count"`
 }
 
 type agifyResp struct {
@@ -35,8 +35,6 @@ type nationalizeResp struct {
 	Country []nationalizeCountry `json:"country"`
 }
 
-// upstreamError carries the name of the API that failed, to build the
-// mandated "${externalApi} returned an invalid response" message.
 type upstreamError struct {
 	API string
 }

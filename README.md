@@ -1,6 +1,6 @@
 # Insighta Labs+ — Backend (Stage 3)
 
-**Live:** https://be-hng-1-production.up.railway.app
+**Live:** https://be-hng-1.onrender.com
 
 A secure, multi-interface profile intelligence platform written in Go. Stage 3
 adds GitHub OAuth (PKCE), role-based access control, refresh-token rotation,

@@ -167,7 +167,8 @@ func clientIP(r *http.Request) string {
 
 func (s *Server) authRateLimit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !s.authLimiter.allow(clientIP(r)) {
+		ip := clientIP(r)
+		if !s.authLimiter.allow(ip) || !s.authLimiter.allow("global") {
 			w.Header().Set("Retry-After", "60")
 			writeError(w, http.StatusTooManyRequests, "Too many requests")
 			return

@@ -80,16 +80,17 @@ func (a *Auth) authGithubCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	setAuthCookies(w, r, access, refresh)
-	if a.cfg.webAppURL == "" {
-		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"status":        "success",
-			"access_token":  access,
-			"refresh_token": refresh,
-			"user":          user,
-		})
-		return
+	if a.cfg.webAppURL != "" {
+		w.Header().Set("Refresh", "0; url="+a.cfg.webAppURL)
 	}
-	http.Redirect(w, r, a.cfg.webAppURL, http.StatusFound)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":        "success",
+		"access_token":  access,
+		"refresh_token": refresh,
+		"token_type":    "Bearer",
+		"expires_in":    int(accessTokenTTL.Seconds()),
+		"user":          user,
+	})
 }
 
 func (a *Auth) authGithubExchange(w http.ResponseWriter, r *http.Request) {

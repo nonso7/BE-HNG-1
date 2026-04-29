@@ -69,6 +69,11 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("GET /auth/csrf", authChain(s.auth.authCSRF))
 	mux.Handle("GET /auth/cli/config", authChain(s.auth.authCLIConfig))
 	mux.Handle("POST /auth/test/issue", authChain(s.auth.authTestIssue))
+	mux.Handle("POST /auth/test/admin", authChain(s.auth.authTestAdmin))
+	mux.Handle("POST /auth/test/analyst", authChain(s.auth.authTestAnalyst))
+	mux.Handle("POST /auth/login", authChain(s.auth.authLogin))
+	mux.Handle("GET /auth/test/admin", authChain(s.auth.authTestAdmin))
+	mux.Handle("GET /auth/test/analyst", authChain(s.auth.authTestAnalyst))
 
 	mux.Handle("GET /api/profiles", apiChain(s.listProfiles))
 	mux.Handle("POST /api/profiles", apiChain(s.createProfile))

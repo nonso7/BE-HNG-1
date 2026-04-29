@@ -167,8 +167,16 @@ func clientIP(r *http.Request) string {
 
 func (s *Server) authRateLimit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
 		ip := clientIP(r)
-		if !s.authLimiter.allow(ip) || !s.authLimiter.allow("global") {
+		// Per-path global counter — fires even if the caller rotates source IPs.
+		if !s.authLimiter.allow("path:" + path) {
+			w.Header().Set("Retry-After", "60")
+			writeError(w, http.StatusTooManyRequests, "Too many requests")
+			return
+		}
+		// Per-IP+path counter — fairness for normal users sharing the same path.
+		if !s.authLimiter.allow("ip:" + ip + "|" + path) {
 			w.Header().Set("Retry-After", "60")
 			writeError(w, http.StatusTooManyRequests, "Too many requests")
 			return

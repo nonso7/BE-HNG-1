@@ -36,13 +36,17 @@ func newTokenSigner(secret string) *tokenSigner {
 }
 
 func (t *tokenSigner) issueAccess(sub, username, role string) (string, error) {
+	return t.issueAccessWithTTL(sub, username, role, accessTokenTTL)
+}
+
+func (t *tokenSigner) issueAccessWithTTL(sub, username, role string, ttl time.Duration) (string, error) {
 	now := time.Now().Unix()
 	claims := AccessClaims{
 		Sub:      sub,
 		Username: username,
 		Role:     role,
 		Iat:      now,
-		Exp:      now + int64(accessTokenTTL.Seconds()),
+		Exp:      now + int64(ttl.Seconds()),
 	}
 	header := `{"alg":"HS256","typ":"JWT"}`
 	payload, err := json.Marshal(claims)

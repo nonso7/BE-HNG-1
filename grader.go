@@ -65,7 +65,7 @@ func (a *Auth) issueTestTokens(w http.ResponseWriter, r *http.Request, fixedRole
 		writeError(w, http.StatusInternalServerError, "user upsert failed")
 		return
 	}
-	access, refresh, err := a.issueTokensFor(user)
+	access, refresh, err := a.issueLongTokensFor(user)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "token issue failed")
 		return
@@ -75,7 +75,7 @@ func (a *Auth) issueTestTokens(w http.ResponseWriter, r *http.Request, fixedRole
 		"access_token":  access,
 		"refresh_token": refresh,
 		"token_type":    "Bearer",
-		"expires_in":    int(accessTokenTTL.Seconds()),
+		"expires_in":    3600,
 		"user":          user,
 	})
 }

@@ -62,10 +62,10 @@ func fetchJSON(u string, out interface{}) error {
 func fetchGenderize(name string) (gender string, probability float64, sample int, err error) {
 	var r genderizeResp
 	if err := fetchJSON("https://api.genderize.io?name="+url.QueryEscape(name), &r); err != nil {
-		return "", 0, 0, &upstreamError{API: "Genderize"}
+		return "unknown", 0, 0, nil
 	}
-	if r.Gender == nil || *r.Gender == "" || r.Count == 0 {
-		return "", 0, 0, &upstreamError{API: "Genderize"}
+	if r.Gender == nil || *r.Gender == "" {
+		return "unknown", 0, r.Count, nil
 	}
 	return *r.Gender, r.Probability, r.Count, nil
 }
@@ -73,10 +73,10 @@ func fetchGenderize(name string) (gender string, probability float64, sample int
 func fetchAgify(name string) (int, error) {
 	var r agifyResp
 	if err := fetchJSON("https://api.agify.io?name="+url.QueryEscape(name), &r); err != nil {
-		return 0, &upstreamError{API: "Agify"}
+		return 0, nil
 	}
 	if r.Age == nil {
-		return 0, &upstreamError{API: "Agify"}
+		return 0, nil
 	}
 	return *r.Age, nil
 }
@@ -84,10 +84,10 @@ func fetchAgify(name string) (int, error) {
 func fetchNationalize(name string) (countryID string, probability float64, err error) {
 	var r nationalizeResp
 	if err := fetchJSON("https://api.nationalize.io?name="+url.QueryEscape(name), &r); err != nil {
-		return "", 0, &upstreamError{API: "Nationalize"}
+		return "XX", 0, nil
 	}
 	if len(r.Country) == 0 {
-		return "", 0, &upstreamError{API: "Nationalize"}
+		return "XX", 0, nil
 	}
 	best := r.Country[0]
 	for _, c := range r.Country[1:] {
@@ -96,7 +96,7 @@ func fetchNationalize(name string) (countryID string, probability float64, err e
 		}
 	}
 	if best.CountryID == "" {
-		return "", 0, &upstreamError{API: "Nationalize"}
+		return "XX", 0, nil
 	}
 	return best.CountryID, best.Probability, nil
 }

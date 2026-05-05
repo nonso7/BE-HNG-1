@@ -1,0 +1,643 @@
+SCALING INSIGHTA LABS+
+A SYSTEM DESIGN FOR SUSTAINED GROWTH (4A)
+PLUS THE STAGE 4B IMPLEMENTATION THAT FOLLOWED IT
+
+Author: Chinonso Nwajagu
+Stage 4A (Design) + Stage 4B (Implementation) — Backend Engineering
+
+Document layout: Sections 1–9 are the Stage 4A design submission, written
+when the requirement was "show how the system *should* evolve under growth".
+Section 10 is the Stage 4B implementation report, written after the
+follow-up brief constrained the work to in-process changes only. The 4A
+design and the 4B implementation differ in scope, not in spirit; section
+10 explains why.
+
+
+================================================================
+1. EXECUTIVE SUMMARY
+================================================================
+
+Insighta Labs+ already works. The question is whether it keeps working as
+the dataset grows from millions to tens of millions of profiles, query
+volume grows to about a thousand per minute, and multiple teams expect
+near-interactive response times.
+
+The design below evolves the existing single-process Go service into a
+small, deliberate set of components: PostgreSQL replaces SQLite, an
+application cache (Redis) absorbs repeated queries, two or three
+stateless API replicas sit behind a load balancer, and a nightly job
+maintains a small set of pre-computed aggregation tables. There are no
+queues, no microservices, no sharding, and no second region. Every
+component on the diagram exists to satisfy a stated requirement; the
+total system is something one engineer can understand on a Monday
+morning.
+
+
+================================================================
+2. REQUIREMENTS
+================================================================
+
+2.1 FUNCTIONAL REQUIREMENTS
+
+  F1.  Authenticated users can submit structured filter queries
+       (gender, country, age range, age group) and receive a paginated
+       list of matching profiles.
+  F2.  Authenticated users can submit aggregation queries (COUNT and
+       GROUP BY over the same dimensions) and receive summary results.
+  F3.  Authenticated users can submit combined filter + aggregation
+       queries.
+  F4.  The system must accept rule-based keyword input (e.g.
+       "young males in South Africa") and translate it into a
+       structured query.
+  F5.  Profile data is loaded via batch ingestion (CSV / JSON drops) at
+       a cadence of hours to days, not seconds.
+  F6.  Every existing Stage 3 capability — GitHub OAuth + PKCE, RBAC,
+       refresh-token rotation, API versioning, CSV export, the CLI, and
+       the web portal — continues to work without modification.
+
+2.2 NON-FUNCTIONAL REQUIREMENTS
+
+  N1.  Latency. P50 < 500 ms, P95 < 2 s for query and aggregation
+       endpoints.
+  N2.  Scalability. Tens of millions of profile rows; up to ~1,500
+       queries per minute (~25 QPS sustained, with bursts).
+  N3.  Reliability. No single API process restart should cause a user-
+       visible outage.
+  N4.  Read consistency. Cached and pre-aggregated results may lag the
+       primary by up to 15 minutes; this is acceptable for an analytics
+       use case where freshness is not safety-critical.
+  N5.  Operability. The system runs in a single region on managed
+       services. One engineer must be able to deploy, observe, and
+       roll back changes.
+  N6.  Cost. Components must stay within reach of a small team's
+       infrastructure budget; no over-provisioning for traffic that
+       does not yet exist.
+
+
+================================================================
+3. CURRENT STATE AND BOTTLENECKS
+================================================================
+
+The Stage 3 system is a single Go binary backed by SQLite, deployed as
+one process on a single host. Three things will break first under
+growth:
+
+  1. SQLite. Single-file, single-writer. With tens of millions of rows
+     and concurrent reads, ad-hoc filter+aggregation queries take
+     seconds, not milliseconds. Index size eventually exceeds working
+     memory.
+  2. One process. A single Go process is a single point of failure.
+     A restart, a panic, a deploy — any of these is downtime.
+  3. No caching. Identical queries hit the database every time. With
+     repeated query patterns from analyst workflows, the database does
+     work it has already done minutes ago.
+
+The design that follows fixes exactly these three things and nothing
+else.
+
+
+================================================================
+4. TARGET ARCHITECTURE
+================================================================
+
+4.1 COMPONENT DIAGRAM
+
+
+   ┌───────────────┐        ┌───────────────┐
+   │      CLI      │        │  Web Portal   │
+   │  (Go binary)  │        │   (Next.js)   │
+   └───────┬───────┘        └───────┬───────┘
+           │  bearer token          │  HttpOnly cookies
+           └────────────┬───────────┘
+                        ▼
+                ┌───────────────┐
+                │ Load Balancer │
+                │  (managed)    │
+                └───────┬───────┘
+                        │
+        ┌───────────────┼───────────────┐
+        ▼               ▼               ▼
+   ┌─────────┐     ┌─────────┐     ┌─────────┐
+   │ API #1  │     │ API #2  │     │ API #3  │   stateless Go,
+   │ (Go)    │     │ (Go)    │     │ (Go)    │   2–3 replicas
+   └────┬────┘     └────┬────┘     └────┬────┘
+        │               │               │
+        └───────┬───────┴───────┬───────┘
+                ▼               ▼
+        ┌──────────────┐   ┌──────────────────┐
+        │    Redis     │   │    PgBouncer     │
+        │  (cache +    │   │ (connection pool)│
+        │ rate limits) │   └────────┬─────────┘
+        └──────────────┘            │
+                          ┌─────────┴──────────┐
+                          ▼                    ▼
+                   ┌──────────────┐    ┌──────────────┐
+                   │  PostgreSQL  │───▶│ Read Replica │
+                   │   primary    │    │  (async)     │
+                   └──────┬───────┘    └──────────────┘
+                          │
+                          ▲
+                  ┌───────────────┐
+                  │ Batch Ingest  │   nightly cron, also
+                  │  worker (Go)  │   refreshes summary
+                  └───────────────┘   tables
+
+
+(A polished version of this diagram, rendered in Excalidraw, is linked
+in the submission form alongside this document.)
+
+
+4.2 COMPONENTS
+
+  Load balancer (managed). Terminates TLS, distributes incoming
+  requests across API replicas, performs health checks. Render's web
+  service load balancer or AWS ALB are both acceptable; no custom
+  proxy code is written.
+
+  API replicas (Go, 2–3). Exact same binary as Stage 3, run as
+  multiple stateless replicas. They hold no per-user state in memory
+  beyond the rate-limit counters (which now move to Redis — see
+  decision D5). Auth, RBAC, version-header checks, query parsing, and
+  response shaping all happen here.
+
+  Redis (managed, single node). Two roles. First, a query-result
+  cache keyed by a hash of the normalised request (filters + sort +
+  page). Second, a shared store for the rate-limit counters, so the
+  per-IP and per-user limits are enforced consistently across all API
+  replicas.
+
+  PgBouncer (or RDS Proxy / managed equivalent). Connection pooler
+  in front of PostgreSQL. Each Go replica opens a small pool to
+  PgBouncer; PgBouncer multiplexes those onto a small fixed number of
+  PostgreSQL connections. This stops connection-storm meltdowns
+  during bursts.
+
+  PostgreSQL primary. The system of record. Replaces SQLite. Holds
+  the profiles table, users table, refresh_tokens table, and a small
+  set of pre-aggregated summary tables refreshed nightly.
+
+  PostgreSQL read replica (async). Receives a replication stream
+  from the primary. All read-only query traffic from the API
+  (filter/list/search/aggregation) is directed here. Writes
+  (profile creation by admin, auth-related writes) go to the
+  primary.
+
+  Batch ingest worker. A small Go program triggered by cron. It
+  picks up new profile drops from object storage, transforms and
+  upserts into the primary, refreshes summary tables, and busts the
+  cache namespace. It is not a service; it is a job.
+
+
+================================================================
+5. DATA FLOW
+================================================================
+
+5.1 QUERY PATH
+
+  1. Client (CLI or web portal) sends a request to the load balancer
+     with an access token and X-API-Version: 1.
+  2. Load balancer forwards to one of the API replicas.
+  3. API verifies the JWT, role, and CSRF (web only).
+  4. API normalises the query into a canonical shape (sorted filter
+     keys, lower-cased values), hashes it, and uses the hash as a
+     Redis cache key.
+  5. Cache hit → API returns the cached JSON in tens of milliseconds.
+  6. Cache miss → API issues the SQL query against PgBouncer, which
+     forwards it to the read replica.
+  7. The result is shaped, cached in Redis with a 5–15 minute TTL
+     (longer for aggregations, shorter for filtered lists), and
+     returned to the client.
+
+5.2 KEYWORD ("NL") PATH
+
+  Identical to the query path, except step 3 is preceded by the
+  rule-based parser that turns "young males in South Africa" into
+  {gender: male, age_min: 18, age_max: 35, country: ZA}. The parsed
+  output is what gets hashed for the cache key, so two phrasings of
+  the same intent share a cache entry.
+
+5.3 INGESTION PATH
+
+  1. Operator drops a CSV/JSON file into the object storage bucket
+     reserved for ingestion (or it lands there from an upstream
+     producer).
+  2. The cron-scheduled batch worker wakes, pulls new files, parses
+     them, and upserts rows into the primary in transactions sized
+     for the network round-trip cost (a few thousand rows per
+     transaction).
+  3. After the upsert phase, the worker runs REFRESH MATERIALIZED
+     VIEW CONCURRENTLY on each summary table.
+  4. Finally, the worker deletes (or rotates the version of) any
+     cache entries that depend on the changed slice — in practice,
+     by bumping a single integer in Redis that is mixed into every
+     cache key. Cheap and total.
+
+5.4 WRITE PATH (USER-DRIVEN)
+
+  Admin POSTs to /api/profiles. The API writes to the primary, then
+  bumps the cache namespace integer so subsequent reads on related
+  filters miss cache and re-fetch. Latency is unaffected.
+
+
+================================================================
+6. DESIGN DECISIONS
+================================================================
+
+Each decision below names the requirement(s) it satisfies and the
+alternatives considered.
+
+D1. POSTGRESQL OVER SQLITE
+    Satisfies: N1, N2, N3.
+    SQLite is excellent for embedded use, terrible for tens of
+    millions of rows under concurrent reads. PostgreSQL gives us a
+    proper query planner, partial and composite indexes, parallel
+    scan, materialized views, and replication — all without writing
+    custom code. It is also the most common managed database, so
+    operability (N5) is essentially free.
+    Alternatives rejected:
+      MySQL — equivalent capabilities, but PostgreSQL's CTEs and
+      window functions are cleaner for the aggregation queries.
+      A column store (DuckDB, ClickHouse) — would be faster for pure
+      analytics but slower for the row-shaped reads the CLI and web
+      portal also need; adds an operational surface for marginal gain
+      at this scale.
+
+D2. INDEX STRATEGY
+    Satisfies: N1.
+    The query mix is dominated by combinations of (country_id,
+    gender, age_group, age range). A composite index on
+    (country_id, gender, age) covers the most common predicate
+    shape and is enough on its own to keep filter queries below
+    100 ms on tens of millions of rows. Single-column indexes on
+    each of those fields remain (cheap, useful for low-selectivity
+    one-off filters). created_at gets its own index for the
+    default sort order. No "index everything"; the planner is fine.
+
+D3. STATELESS API + LOAD BALANCER (2–3 REPLICAS)
+    Satisfies: N3, N2.
+    The same Go binary, run multiple times, removes the
+    single-process outage risk and lets us scale capacity by
+    adding replicas. Statelessness is achievable because the only
+    server-side state Stage 3 had was the in-memory PKCE store and
+    the rate-limit counters; both move to Redis (see D4, D5).
+
+D4. REDIS QUERY-RESULT CACHE
+    Satisfies: N1, N2.
+    Analyst workflows produce repeated query patterns ("count of
+    young males in NG this week" run by every dashboard viewer).
+    A small managed Redis with TTL-based caching of normalised
+    query JSON answers tens of milliseconds where the database
+    would have spent 200–800. With even a modest 30–40% hit rate,
+    database load is cut by the same fraction — the difference
+    between a happy primary and a hot one.
+    Cache key design: a SHA-256 of the canonical request shape,
+    prefixed with a namespace integer that the ingest job and admin
+    writes bump on relevant changes. Invalidation becomes a single
+    INCR.
+
+D5. MOVE PKCE STATE AND RATE LIMITS TO REDIS
+    Satisfies: N3 (consistency across replicas), N1 (rate-limit
+    correctness during bursts).
+    Stage 3 stored both in process memory. With multiple replicas,
+    a user could hit rate-limit budget on replica A and still get
+    served by replica B. Redis becomes the shared store; counters
+    become atomic INCR with EXPIRE.
+
+D6. POSTGRESQL READ REPLICA
+    Satisfies: N1, N2.
+    Reads dominate writes (analytics workload, batch writes). An
+    async replica absorbs all read-only API traffic; the primary
+    only handles writes (admin POST/DELETE, auth) and the
+    replication stream. Lag of a few seconds is acceptable per N4.
+    A single replica is enough for this scale; we can grow to two
+    later without redesign.
+
+D7. PRE-COMPUTED SUMMARY TABLES
+    Satisfies: N1.
+    Aggregation queries like "count of profiles grouped by
+    country and age_group" are answered from a refreshed-nightly
+    materialized view that is roughly 1000× smaller than the
+    source table. Even cold from disk, these queries return in
+    under 50 ms. The freshness ceiling is one ingest cycle, which
+    matches N4.
+    Tables maintained: profiles_by_country_gender,
+    profiles_by_age_group, profiles_by_country_age_group. Each
+    refreshed CONCURRENTLY so production reads continue.
+
+D8. PGBOUNCER (CONNECTION POOLER)
+    Satisfies: N3.
+    Without pooling, a burst of 50 concurrent requests across 3
+    API replicas opens 150 PostgreSQL connections — Postgres falls
+    over well before that on small instances. PgBouncer in
+    transaction-pooling mode keeps the actual PostgreSQL
+    connection count bounded (e.g. 25), and the API's wait time
+    for a pool slot stays in single-digit milliseconds.
+
+D9. KEEP THE CLI/WEB CONTRACT UNCHANGED
+    Satisfies: F6.
+    Nothing in the Stage 3 spec — endpoint paths, request/response
+    shapes, header conventions — changes. The CLI binary published
+    to npm and the deployed web portal continue to work without
+    redeploy.
+
+D10. SINGLE REGION, MANAGED SERVICES
+    Satisfies: N5, N6.
+    Multi-region adds replication topology, conflict resolution,
+    and DNS failover, none of which is justified at this volume
+    or for this consistency model. Managed Postgres, managed
+    Redis, and a managed load balancer cost less in engineer-time
+    than running our own.
+
+
+================================================================
+7. TRADE-OFFS AND LIMITATIONS
+================================================================
+
+L1. STALENESS. Cached responses can lag the primary by up to the
+    TTL (5–15 minutes), and pre-aggregations lag by one ingest
+    cycle. This is fine for analytics but unfit for any
+    safety-critical use case. We accept this explicitly.
+
+L2. NO CROSS-REGION FAILOVER. A regional outage in our cloud
+    provider takes the whole system down. Acceptable at this
+    scale; documenting it as a known risk rather than spending
+    weeks preventing it.
+
+L3. WRITE THROUGHPUT IS NOT THE BOTTLENECK WE'RE OPTIMISING FOR.
+    Batch ingestion is rare and tolerant of latency. If Insighta
+    ever moves to streaming ingestion, the primary becomes the
+    pressure point and this design needs a queue (see bonus).
+
+L4. REDIS IS A SINGLE POINT. Its outage degrades performance and
+    makes rate limiting inconsistent across replicas, but does not
+    break correctness — the API still serves from the database.
+    A managed Redis with snapshotting is sufficient.
+
+L5. THE "NL QUERY" IS A RULE-BASED PARSER, NOT NL UNDERSTANDING.
+    Anything outside the parser's grammar fails with a 422. This
+    is intentional under the current product scope (see bonus for
+    the upgrade path).
+
+L6. SCHEMA MIGRATIONS ARE NOT DESIGNED FOR ZERO DOWNTIME. With
+    tens of millions of rows, an ALTER TABLE that rewrites the
+    table will take minutes. The team accepts a maintenance window
+    or uses tooling like pg_repack for online changes; this is an
+    operational discipline, not a design feature.
+
+L7. LIMITED OBSERVABILITY OUT OF THE BOX. Request logs already
+    exist (Stage 3). Adding structured logging to a managed log
+    service plus PostgreSQL slow-query logging is a follow-up
+    that costs an afternoon, not a redesign.
+
+
+================================================================
+8. BONUS: FUTURE EVOLUTION
+================================================================
+
+8.1 REAL-TIME ANALYTICS
+
+  When freshness becomes a requirement, the cleanest evolution is
+  to treat ingestion as a stream rather than a batch:
+
+    a. A producer writes profile changes to a managed message
+       broker (Kafka, Kinesis, or Pub/Sub) instead of dropping
+       files.
+    b. A consumer service writes to the PostgreSQL primary and
+       simultaneously updates a small set of incrementally
+       maintained aggregations (pre-summed counts in Redis or in
+       a dedicated table).
+    c. Cache TTLs drop to seconds for aggregations; the cache
+       namespace is bumped on every consumer batch instead of
+       once per ingest run.
+
+  The point is that real-time arrives by *replacing* the batch
+  worker, not by re-architecting the API. The query path —
+  cache → replica → response — is unchanged.
+
+8.2 TRUE NATURAL-LANGUAGE QUERIES
+
+  The current rule-based parser is a deliberate floor. The
+  upgrade path is:
+
+    a. Define a small structured target schema: the same
+       {filters, aggregations, sort, limit} shape the API
+       already accepts.
+    b. Add a stateless "NL service" that takes free text and
+       calls a hosted LLM with a prompt: "translate the user
+       request into the schema; refuse if you cannot." The LLM
+       outputs JSON, which the API then validates and runs
+       through the existing query path.
+    c. Cache LLM outputs by prompt hash so repeated phrasings
+       cost one LLM call once.
+    d. Keep the rule-based parser as a fallback for the offline
+       case and for the LLM's "I don't know" responses.
+
+  This separates "language understanding" (a third-party
+  capability that improves over time) from "query execution"
+  (our system, slow-changing). The database, cache, and
+  replicas don't change.
+
+
+================================================================
+9. SUMMARY
+================================================================
+
+Three components answer the three problems:
+
+  - PostgreSQL with proper indexes and pre-aggregations replaces
+    SQLite and absorbs the data growth.
+  - Redis caches the queries that repeat themselves and shares
+    rate-limit state across replicas.
+  - A small load-balanced fleet of stateless Go API replicas
+    removes the single-process outage and scales out cheaply.
+
+A connection pooler, a read replica, and a nightly batch worker
+fill in the edges. Everything else from Stage 3 — the auth flow,
+the RBAC middleware, the CLI, the web portal, the API contract —
+is unchanged.
+
+The design is unspectacular by intent. It uses the cheapest
+component that satisfies each requirement and stops. The benefit
+of that discipline is not theoretical: at 25 QPS sustained and
+10 million rows, this stack runs on small managed instances, can
+be reasoned about end-to-end on a whiteboard, and gives any
+future engineer a clear answer to "where would I start
+debugging?" — which is, in practice, the only system-design
+quality that matters once the page loads.
+
+
+================================================================
+10. STAGE 4B IMPLEMENTATION — WHAT ACTUALLY GOT BUILT
+================================================================
+
+Stage 4B reframed the problem with three explicit constraints:
+
+  - No new database systems (no Redis, no Postgres).
+  - No horizontal scaling. Single process.
+  - Limited compute resources.
+
+Under those rules, three of the 4A decisions (D1 PostgreSQL,
+D5 shared rate limit + PKCE in Redis, D6 read replica) are off
+the table — they all introduce a new database system. D3
+(multiple API replicas), D8 (PgBouncer), and D10 (managed
+service expansion) are also pushed out: they're horizontal-
+scaling moves. What remains, and what 4B asks for, is a tighter
+local subset:
+
+  - D2 INDEX STRATEGY → kept and shipped.
+  - D4 RESULT CACHE → kept and shipped, but in-process LRU
+    instead of Redis. Same shape, one fewer hop, no new
+    infrastructure.
+  - D7 PRE-COMPUTED AGGREGATIONS → not shipped. The dataset at
+    4B scale (1M rows) is small enough that indexed COUNT/GROUP
+    BY queries answer in low ms; summary tables would have been
+    pre-optimisation. Re-introduced in the 4A design for the
+    larger 10M-row target.
+  - NEW: streaming CSV import. The 4A design only mentioned
+    batch ingest in passing; 4B made it a hard deliverable.
+
+10.1 WHAT IS LIVE IN THE CODE TODAY
+
+  Composite indexes on (country_id, gender, age) and
+    (country_id, gender, age_group) cover the dominant filter
+    shapes; SQLite's planner picks the leftmost prefix
+    automatically for narrower filters. A LOWER(name) index
+    accelerates per-row idempotency checks during ingest.
+
+  SQLite tuning. WAL was already on; we add busy_timeout=5000
+    so reads briefly wait instead of failing during a commit,
+    cache_size=-65536 (64 MiB page cache), mmap_size=256 MiB,
+    and temp_store=MEMORY. The Go driver's connection pool is
+    capped at 8 to keep reader concurrency healthy; SQLite
+    serializes writers itself.
+
+  In-process LRU cache. 1,024 entries, 5-minute TTL, JSON
+    bytes as values (cache hit = one memcpy + one Write, no
+    re-marshal). Invalidation via an atomic namespace counter
+    mixed into every key — bumping it on writes makes all
+    existing entries unreachable in O(1) without walking the
+    LRU.
+
+  Canonical filter normalization. canonicalFilter() in
+    normalize.go renders any ListFilter into a stable string
+    (sorted keys, case-folded values, default sort/order/page/
+    limit filled in). The cache key is a SHA-256 prefix of that
+    string. Two requests that parse to the same intent produce
+    the same cache key regardless of URL parameter order or
+    rule-based phrasing.
+
+  Streaming CSV import. POST /api/profiles/import (admin only,
+    same RBAC chain as POST /api/profiles). Accepts text/csv or
+    multipart/form-data. The csv.Reader streams over r.Body or
+    r.MultipartReader() — the 500K-row ceiling never sits in
+    memory. Validated rows accumulate in a 500-row chunk and
+    are flushed as a short transaction. Bad rows are skipped
+    with categorised reason counters. The response is the exact
+    JSON shape the brief specified, including the dynamic
+    "reasons" map.
+
+  Cache invalidation on every admin write path. createProfile,
+    deleteProfile, and importProfiles all call cache.Bump() on
+    success.
+
+10.2 BEFORE / AFTER MEASUREMENTS
+
+  Dataset: 502,026 profiles (2,026 seeded + 500,000 imported).
+  Single Go process on a small developer host. Each row is the
+  average of 20 runs.
+
+  Query                                 Cold       Hot      Speedup
+  ----------------------------------    ----       ----     -------
+  filter gender + country (compound)    178.7 ms   1.2 ms   149×
+  filter gender + age_group               1.0 ms   0.8 ms   page cache
+  search "young males in ng"              0.9 ms   0.9 ms   page cache
+  filter gender + country + age range     1.3 ms   1.4 ms   page cache
+
+  500,000-row CSV import, all valid:    165 s   (~3,000 rows/sec).
+  Read latency during a concurrent
+  50,000-row import:                    1–3 ms (no measurable
+                                                degradation).
+
+  Read on the dramatic-looking row: the cold compound case is
+  the request that pays the full SQLite scan + index seek + JSON
+  marshal cost the very first time after an invalidation. Once
+  SQLite's own page cache is warm, the underlying queries are
+  already sub-2 ms — the app cache then mostly saves JSON
+  marshalling. Both regimes sit comfortably inside the
+  "low hundreds of milliseconds" target the 4B brief asked for.
+
+10.3 WHY THE 4A DESIGN STAYS RELEVANT
+
+  Stage 4B's constraints — no new databases, no horizontal
+  scaling, limited compute — are deliberate exam framing, not
+  a forever rule. Once Insighta really crosses tens of millions
+  of rows, the things 4B forbade are the things 4A prescribed:
+
+    - SQLite's single-writer property starts hurting concurrent
+      imports. Postgres + a connection pooler (D1, D8) addresses
+      it.
+    - A single process is a single point of failure regardless
+      of optimisation. 2–3 stateless replicas behind a load
+      balancer (D3) addresses it.
+    - In-process cache state is unsharable across those
+      replicas, so the cache I built becomes per-replica with
+      reduced hit rate. Redis (D4 in its 4A form, plus D5)
+      addresses it.
+
+  In other words: 4B is the 4A design, projected onto a single
+  process. The promotion path is additive — every component the
+  4A design called for can be slotted in later without rewriting
+  the 4B work. The cache interface stays. The query
+  normalization stays. The composite indexes stay (and become
+  Postgres composite indexes verbatim). The CSV importer stays
+  (and becomes the seed for the 4A "batch ingest worker"
+  component).
+
+10.4 SOLUTION ARTIFACTS
+
+  Code changes are scoped to:
+    - cache.go         (new)
+    - normalize.go     (new)
+    - bulk_import.go   (new)
+    - store.go         (composite indexes, pragmas, BulkInsertIgnore)
+    - handlers.go      (cache wiring, /api/profiles/import route)
+
+  SOLUTION.md in the repo root explains each part with the
+  numbers above, the validation rules, and the trade-offs.
+  Stage 3 contracts (auth, RBAC, /api/* paths, response shapes)
+  are unchanged.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Before submitting
+Paste into a Google Doc and verify it lands in the 2–7 page range (it will, but check the auto-formatting doesn't bloat it).
+Make a real diagram. The ASCII version inside the doc is fine as a textual reference, but the rubric asks for an embedded image AND a link to the original. Quickest paths:
+Excalidraw (excalidraw.com) — drag rectangles, save as PNG, embed.
+draw.io / diagrams.net — same idea, exports to PNG cleanly.
+Mermaid Live Editor (mermaid.live) — if you want to keep it source-controllable. I can hand you a Mermaid source if you want to render it that way.
+Set sharing to "Anyone with the link can view" before submitting (per the rubric).
+Replace the placeholder line (A polished version of this diagram, rendered in Excalidraw, is linked in the submission form alongside this document.) with the actual link to your diagram once you make it.
+Want me to generate the Mermaid source for the diagram so you can render and embed it?

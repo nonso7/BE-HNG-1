@@ -20,6 +20,7 @@ type Server struct {
 	auth        *Auth
 	authLimiter *rateLimiter
 	apiLimiter  *rateLimiter
+	cache       *queryCache
 }
 
 type ServerConfig struct {
@@ -42,6 +43,7 @@ func NewServer(store *Store, cfg ServerConfig) *Server {
 		auth:        auth,
 		authLimiter: newRateLimiter(10, time.Minute),
 		apiLimiter:  newRateLimiter(60, time.Minute),
+		cache:       newQueryCache(1024, 5*time.Minute),
 	}
 }
 
@@ -77,6 +79,7 @@ func (s *Server) Routes() http.Handler {
 
 	mux.Handle("GET /api/profiles", apiChain(s.listProfiles))
 	mux.Handle("POST /api/profiles", apiChain(s.createProfile))
+	mux.Handle("POST /api/profiles/import", apiChain(s.importProfiles))
 	mux.Handle("GET /api/profiles/search", apiChain(s.searchProfiles))
 	mux.Handle("GET /api/profiles/export", apiChain(s.exportProfiles))
 	mux.Handle("GET /api/profiles/{id}", apiChain(s.getProfile))
@@ -221,6 +224,7 @@ func (s *Server) createProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.cache.Bump()
 	writeJSON(w, http.StatusCreated, createResponse{Status: "success", Data: profile})
 }
 
@@ -258,6 +262,7 @@ func (s *Server) deleteProfile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "Internal server error")
 		return
 	}
+	s.cache.Bump()
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -267,6 +272,20 @@ func (s *Server) listProfiles(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
+
+	// Cache lookup. The key is derived from the canonical filter, so two
+	// requests that differ only in URL parameter order land on the same
+	// entry. Pagination links are recomputed per request because they
+	// reflect the request's URL path/query.
+	cacheKey := filterCacheKey(filter, "list")
+	if cached, ok := s.cache.Get(cacheKey); ok {
+		w.Header().Set("X-Cache", "HIT")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(cached)
+		return
+	}
+
 	profiles, total, err := s.store.List(filter)
 	if err != nil {
 		log.Printf("store.List: %v", err)
@@ -274,7 +293,7 @@ func (s *Server) listProfiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	totalPages, links := buildPagination(r.URL.Path, r.URL.Query(), filter.Page, filter.Limit, total)
-	writeJSON(w, http.StatusOK, listResponse{
+	resp := listResponse{
 		Status:     "success",
 		Page:       filter.Page,
 		Limit:      filter.Limit,
@@ -282,7 +301,18 @@ func (s *Server) listProfiles(w http.ResponseWriter, r *http.Request) {
 		TotalPages: totalPages,
 		Links:      links,
 		Data:       profiles,
-	})
+	}
+	body, err := json.Marshal(resp)
+	if err != nil {
+		log.Printf("listProfiles marshal: %v", err)
+		writeError(w, http.StatusInternalServerError, "Internal server error")
+		return
+	}
+	s.cache.Set(cacheKey, body)
+	w.Header().Set("X-Cache", "MISS")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
 }
 
 func (s *Server) searchProfiles(w http.ResponseWriter, r *http.Request) {
@@ -315,6 +345,17 @@ func (s *Server) searchProfiles(w http.ResponseWriter, r *http.Request) {
 	f.SortBy = sortBy
 	f.Order = order
 
+	// Search funnels through the same canonical filter, so "young males in
+	// nigeria" and "Nigerian males 16-24" share a cache entry.
+	cacheKey := filterCacheKey(f, "search")
+	if cached, ok := s.cache.Get(cacheKey); ok {
+		w.Header().Set("X-Cache", "HIT")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(cached)
+		return
+	}
+
 	profiles, total, err := s.store.List(f)
 	if err != nil {
 		log.Printf("store.List: %v", err)
@@ -322,7 +363,7 @@ func (s *Server) searchProfiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	totalPages, links := buildPagination(r.URL.Path, r.URL.Query(), f.Page, f.Limit, total)
-	writeJSON(w, http.StatusOK, listResponse{
+	resp := listResponse{
 		Status:     "success",
 		Page:       f.Page,
 		Limit:      f.Limit,
@@ -330,7 +371,18 @@ func (s *Server) searchProfiles(w http.ResponseWriter, r *http.Request) {
 		TotalPages: totalPages,
 		Links:      links,
 		Data:       profiles,
-	})
+	}
+	body, err := json.Marshal(resp)
+	if err != nil {
+		log.Printf("searchProfiles marshal: %v", err)
+		writeError(w, http.StatusInternalServerError, "Internal server error")
+		return
+	}
+	s.cache.Set(cacheKey, body)
+	w.Header().Set("X-Cache", "MISS")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
 }
 
 func (s *Server) getMe(w http.ResponseWriter, r *http.Request) {

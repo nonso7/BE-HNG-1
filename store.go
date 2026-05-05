@@ -25,11 +25,23 @@ func OpenStore(path string) (*Store, error) {
 		`PRAGMA journal_mode=WAL;`,
 		`PRAGMA synchronous=NORMAL;`,
 		`PRAGMA foreign_keys=ON;`,
+		// Stage 4B: tolerate the writer holding the lock during chunked imports
+		// instead of failing reads with SQLITE_BUSY.
+		`PRAGMA busy_timeout=5000;`,
+		// 64 MiB page cache — keeps hot index pages in memory; cheap on any host.
+		`PRAGMA cache_size=-65536;`,
+		`PRAGMA temp_store=MEMORY;`,
+		`PRAGMA mmap_size=268435456;`,
 	} {
 		if _, err := db.Exec(pragma); err != nil {
 			return nil, err
 		}
 	}
+	// One writer at a time (SQLite invariant). Many concurrent readers are
+	// fine and benefit from a bigger pool.
+	db.SetMaxOpenConns(8)
+	db.SetMaxIdleConns(4)
+	db.SetConnMaxLifetime(0)
 	var tableExists int
 	_ = db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='profiles'`).Scan(&tableExists)
 	if tableExists > 0 {
@@ -61,6 +73,13 @@ func OpenStore(path string) (*Store, error) {
 	CREATE INDEX IF NOT EXISTS idx_profiles_gender_prob ON profiles(gender_probability);
 	CREATE INDEX IF NOT EXISTS idx_profiles_country_prob ON profiles(country_probability);
 	CREATE INDEX IF NOT EXISTS idx_profiles_created_at ON profiles(created_at);
+	-- Stage 4B: composite indexes for the dominant filter shapes
+	-- (country_id + gender + age range) and (country_id + gender + age_group).
+	-- Picks up the leftmost prefix automatically for narrower filters too.
+	CREATE INDEX IF NOT EXISTS idx_profiles_cga ON profiles(country_id, gender, age);
+	CREATE INDEX IF NOT EXISTS idx_profiles_cgag ON profiles(country_id, gender, age_group);
+	-- Case-insensitive lookups by name during ingestion / GetByName.
+	CREATE INDEX IF NOT EXISTS idx_profiles_name_lower ON profiles(LOWER(name));
 
 	CREATE TABLE IF NOT EXISTS users (
 		id TEXT PRIMARY KEY,
@@ -150,6 +169,53 @@ func (s *Store) InsertIgnore(p *Profile) (bool, error) {
 		return false, err
 	}
 	return n > 0, nil
+}
+
+// BulkInsertIgnore inserts a chunk of profiles inside a single transaction,
+// skipping rows whose name already exists. Returns (insertedCount,
+// duplicateCount, err). Each call is one short write transaction so concurrent
+// readers never wait on a long-held writer. CSV imports call this once per
+// chunk (default 500 rows) rather than once per row.
+func (s *Store) BulkInsertIgnore(profiles []*Profile) (int, int, error) {
+	if len(profiles) == 0 {
+		return 0, 0, nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	stmt, err := tx.Prepare(
+		`INSERT OR IGNORE INTO profiles (` + profileColumns + `)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	)
+	if err != nil {
+		_ = tx.Rollback()
+		return 0, 0, err
+	}
+	defer stmt.Close()
+	inserted := 0
+	for _, p := range profiles {
+		res, err := stmt.Exec(
+			p.ID, p.Name, p.Gender, p.GenderProbability, p.Age, p.AgeGroup,
+			p.CountryID, p.CountryName, p.CountryProbability,
+			p.CreatedAt.Time().UTC().Format(time.RFC3339Nano),
+		)
+		if err != nil {
+			_ = tx.Rollback()
+			return 0, 0, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			_ = tx.Rollback()
+			return 0, 0, err
+		}
+		inserted += int(n)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	dup := len(profiles) - inserted
+	return inserted, dup, nil
 }
 
 func (s *Store) Insert(p *Profile) error {
